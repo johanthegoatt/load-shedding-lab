@@ -1,7 +1,8 @@
 import { rng, exponential, arrivals, percentile } from "./rng.js";
 
 // A c-server queue fed by a Poisson stream, simulated event by event.
-// Service times are exponential with mean `service` ms. `load` is the offered
+// Service times are exponential with mean `service` ms (an RPC doing about a
+// millisecond of work by default). `load` is the offered
 // load as a fraction of capacity (servers / service requests per ms); pass
 // `rate` (per ms, a number or a function of t) with `peak` to vary it.
 //
@@ -12,18 +13,29 @@ import { rng, exponential, arrivals, percentile } from "./rng.js";
 // see it: a request whose client has gone still gets served, and that work is
 // wasted. Goodput counts only answers that arrive in time.
 //
+// `policy: "codel"` is the server-side variant of CoDel that Facebook describes
+// in Fail at Scale (Maurer, ACM Queue 2015). Nichols and Jacobson's insight
+// (RFC 8289) is that a good queue drains and a bad one stands. So instead of a
+// size limit, each request gets a queue timeout when it is enqueued: `interval`
+// ms (N) normally, but only `target` ms (M) once the queue has not been empty
+// for N ms. A request that outwaits its timeout is shed when it reaches the
+// front, before any work is spent on it.
+//
 // Arrivals and service times come from separate seeded streams and are fixed
 // per request before the run, so two policies given the same seed see exactly
 // the same traffic and the same work.
 export function simulate({
   servers = 1,
-  service = 10,
+  service = 1,
   load = 0.5,
   rate,
   peak,
   duration = 600000,
   capacity = Infinity,
   deadline = Infinity,
+  policy = "fifo",
+  target = 5,
+  interval = 100,
   seed = 1,
   warmup = 0.1,
 } = {}) {
@@ -36,8 +48,28 @@ export function simulate({
   const startAt = new Float64Array(n).fill(NaN);
   const doneAt = new Float64Array(n).fill(NaN);
   const freeAt = new Float64Array(servers);
+  const shed = new Uint8Array(n);
+  const timeout = new Float64Array(n).fill(Infinity);
+  const codel = policy === "codel";
   const q = [];
   let head = 0;
+  // When the queue last went from empty to non-empty.
+  let nonEmptySince = 0;
+
+  const enqueue = (id, t) => {
+    if (q.length === head) { q.length = head = 0; nonEmptySince = t; }
+    if (codel) timeout[id] = t - nonEmptySince > interval ? target : interval;
+    q.push(id);
+  };
+  // Next request worth serving at time t, or -1 if the queue runs dry.
+  const dequeue = (t) => {
+    while (q.length > head) {
+      const id = q[head++];
+      if (t - arr[id] <= timeout[id]) return id;
+      shed[id] = 1;
+    }
+    return -1;
+  };
 
   const start = (id, s, t) => {
     startAt[id] = t;
@@ -52,30 +84,37 @@ export function simulate({
     if (q.length > head && (i >= n || freeAt[s] <= arr[i])) {
       // Every server was busy when these requests queued, so the freed server
       // takes the next one at the moment it frees.
-      start(q[head++], s, freeAt[s]);
+      const t = freeAt[s], id = dequeue(t);
+      if (id >= 0) start(id, s, t);
+      // If everything queued had timed out, the server idles until the next arrival.
+      else freeAt[s] = Math.min(t, i < n ? arr[i] : t);
     } else {
       const id = i++, t = arr[id];
       if (q.length === head && freeAt[s] <= t) start(id, s, t);
-      else if (q.length - head < capacity) q.push(id);
+      else if (q.length - head < capacity) enqueue(id, t);
       // Rejected requests never reach a server; startAt stays NaN.
     }
   }
 
-  return measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup, deadline });
+  return measure({ arr, svc, startAt, doneAt, shed, servers, service, duration, warmup, deadline });
 }
 
 // Summarise requests that arrived after the warmup window.
-export function measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup, deadline = Infinity }) {
+export function measure({ arr, svc, startAt, doneAt, shed, servers, service, duration, warmup, deadline = Infinity }) {
   const from = duration * warmup, span = duration - from;
   const sojourn = [], waits = [], good = [];
-  let offered = 0, busy = 0, rejected = 0, wasted = 0;
+  let offered = 0, work = 0, busy = 0, rejected = 0, dropped = 0, wasted = 0;
   for (let id = 0; id < arr.length; id++) {
+    // Busy time counts every request served inside the window, including a
+    // backlog that queued during warmup.
+    if (!Number.isNaN(startAt[id])) busy += Math.max(0, Math.min(doneAt[id], duration) - Math.max(startAt[id], from));
     if (arr[id] < from) continue;
     offered++;
+    if (shed?.[id]) { dropped++; continue; }
     if (Number.isNaN(startAt[id])) { rejected++; continue; }
     sojourn.push(doneAt[id] - arr[id]);
     waits.push(startAt[id] - arr[id]);
-    busy += svc[id];
+    work += svc[id];
     if (doneAt[id] - arr[id] <= deadline) good.push(doneAt[id] - arr[id]);
     else wasted += svc[id];
   }
@@ -87,18 +126,21 @@ export function measure({ arr, svc, startAt, doneAt, servers, service, duration,
     offered,
     served: s.length,
     rejected,
+    // Timed out in the queue and dropped before any work was spent.
+    shed: dropped,
     good: g.length,
     late: s.length - g.length,
     capacity,
     // Answers delivered in time, as a fraction of what the servers can do.
     goodput: g.length / capacity,
     // Share of server time spent on answers nobody was waiting for.
-    wasted: wasted / (busy || 1),
+    wasted: wasted / (work || 1),
     goodP99: percentile(g, 0.99),
     meanWait: mean(waits),
     meanSojourn: mean(sojourn),
     p50: percentile(s, 0.5),
     p99: percentile(s, 0.99),
+    // Server time inside the measured window that was spent serving.
     utilization: busy / (servers * span),
   };
 }
