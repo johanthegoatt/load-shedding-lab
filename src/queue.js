@@ -5,6 +5,9 @@ import { rng, exponential, arrivals, percentile } from "./rng.js";
 // load as a fraction of capacity (servers / service requests per ms); pass
 // `rate` (per ms, a number or a function of t) with `peak` to vary it.
 //
+// `capacity` bounds the waiting room (requests in service do not count). An
+// arrival that finds it full is rejected on the spot: drop-tail.
+//
 // Arrivals and service times come from separate seeded streams and are fixed
 // per request before the run, so two policies given the same seed see exactly
 // the same traffic and the same work.
@@ -15,6 +18,7 @@ export function simulate({
   rate,
   peak,
   duration = 600000,
+  capacity = Infinity,
   seed = 1,
   warmup = 0.1,
 } = {}) {
@@ -47,7 +51,8 @@ export function simulate({
     } else {
       const id = i++, t = arr[id];
       if (q.length === head && freeAt[s] <= t) start(id, s, t);
-      else q.push(id);
+      else if (q.length - head < capacity) q.push(id);
+      // Rejected requests never reach a server; startAt stays NaN.
     }
   }
 
@@ -58,10 +63,11 @@ export function simulate({
 export function measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup }) {
   const from = duration * warmup, span = duration - from;
   const sojourn = [], waits = [];
-  let offered = 0, busy = 0;
+  let offered = 0, busy = 0, rejected = 0;
   for (let id = 0; id < arr.length; id++) {
     if (arr[id] < from) continue;
     offered++;
+    if (Number.isNaN(startAt[id])) { rejected++; continue; }
     sojourn.push(doneAt[id] - arr[id]);
     waits.push(startAt[id] - arr[id]);
     busy += svc[id];
@@ -71,6 +77,7 @@ export function measure({ arr, svc, startAt, doneAt, servers, service, duration,
   return {
     offered,
     served: s.length,
+    rejected,
     capacity: (servers / service) * span,
     meanWait: mean(waits),
     meanSojourn: mean(sojourn),
@@ -82,6 +89,13 @@ export function measure({ arr, svc, startAt, doneAt, servers, service, duration,
 
 // Mean time in system for M/M/1: 1 / (mu - lambda).
 export const mm1Sojourn = (load, service) => service / (1 - load);
+
+// M/M/1/K blocking probability, K counting the request in service:
+// (1 - rho) rho^K / (1 - rho^(K + 1)).
+export function mm1kBlocking(load, K) {
+  if (load === 1) return 1 / (K + 1);
+  return ((1 - load) * load ** K) / (1 - load ** (K + 1));
+}
 
 // Erlang C: probability an arrival waits in M/M/c, and the mean wait.
 export function erlangC(servers, load) {
