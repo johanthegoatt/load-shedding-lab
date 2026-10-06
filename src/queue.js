@@ -8,6 +8,10 @@ import { rng, exponential, arrivals, percentile } from "./rng.js";
 // `capacity` bounds the waiting room (requests in service do not count). An
 // arrival that finds it full is rejected on the spot: drop-tail.
 //
+// `deadline` is how long a client waits before giving up. The server cannot
+// see it: a request whose client has gone still gets served, and that work is
+// wasted. Goodput counts only answers that arrive in time.
+//
 // Arrivals and service times come from separate seeded streams and are fixed
 // per request before the run, so two policies given the same seed see exactly
 // the same traffic and the same work.
@@ -19,6 +23,7 @@ export function simulate({
   peak,
   duration = 600000,
   capacity = Infinity,
+  deadline = Infinity,
   seed = 1,
   warmup = 0.1,
 } = {}) {
@@ -56,14 +61,14 @@ export function simulate({
     }
   }
 
-  return measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup });
+  return measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup, deadline });
 }
 
 // Summarise requests that arrived after the warmup window.
-export function measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup }) {
+export function measure({ arr, svc, startAt, doneAt, servers, service, duration, warmup, deadline = Infinity }) {
   const from = duration * warmup, span = duration - from;
-  const sojourn = [], waits = [];
-  let offered = 0, busy = 0, rejected = 0;
+  const sojourn = [], waits = [], good = [];
+  let offered = 0, busy = 0, rejected = 0, wasted = 0;
   for (let id = 0; id < arr.length; id++) {
     if (arr[id] < from) continue;
     offered++;
@@ -71,14 +76,25 @@ export function measure({ arr, svc, startAt, doneAt, servers, service, duration,
     sojourn.push(doneAt[id] - arr[id]);
     waits.push(startAt[id] - arr[id]);
     busy += svc[id];
+    if (doneAt[id] - arr[id] <= deadline) good.push(doneAt[id] - arr[id]);
+    else wasted += svc[id];
   }
+  const g = Float64Array.from(good).sort();
+  const capacity = (servers / service) * span;
   const s = Float64Array.from(sojourn).sort();
   const mean = (xs) => xs.reduce((a, b) => a + b, 0) / (xs.length || 1);
   return {
     offered,
     served: s.length,
     rejected,
-    capacity: (servers / service) * span,
+    good: g.length,
+    late: s.length - g.length,
+    capacity,
+    // Answers delivered in time, as a fraction of what the servers can do.
+    goodput: g.length / capacity,
+    // Share of server time spent on answers nobody was waiting for.
+    wasted: wasted / (busy || 1),
+    goodP99: percentile(g, 0.99),
     meanWait: mean(waits),
     meanSojourn: mean(sojourn),
     p50: percentile(s, 0.5),
