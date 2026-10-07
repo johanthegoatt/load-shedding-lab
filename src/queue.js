@@ -21,6 +21,13 @@ import { rng, exponential, arrivals, percentile } from "./rng.js";
 // for N ms. A request that outwaits its timeout is shed when it reaches the
 // front, before any work is spent on it.
 //
+// Adaptive LIFO, from the same article: serve oldest-first normally, but once
+// the queue has stood for `interval` ms serve the newest request first, since
+// it is the one whose client is most likely still waiting. `policy: "lifo"`
+// uses it alone, `"codel-lifo"` pairs it with the CoDel timeouts.
+//
+// `bucket` (ms) adds a per-bucket timeline of goodput and p99, by arrival time.
+//
 // Arrivals and service times come from separate seeded streams and are fixed
 // per request before the run, so two policies given the same seed see exactly
 // the same traffic and the same work.
@@ -36,6 +43,7 @@ export function simulate({
   policy = "fifo",
   target = 5,
   interval = 100,
+  bucket = 0,
   seed = 1,
   warmup = 0.1,
 } = {}) {
@@ -50,7 +58,8 @@ export function simulate({
   const freeAt = new Float64Array(servers);
   const shed = new Uint8Array(n);
   const timeout = new Float64Array(n).fill(Infinity);
-  const codel = policy === "codel";
+  if (!["fifo", "codel", "lifo", "codel-lifo"].includes(policy)) throw new Error(`unknown policy ${policy}`);
+  const codel = policy.includes("codel"), lifo = policy.includes("lifo");
   const q = [];
   let head = 0;
   // When the queue last went from empty to non-empty.
@@ -63,8 +72,11 @@ export function simulate({
   };
   // Next request worth serving at time t, or -1 if the queue runs dry.
   const dequeue = (t) => {
+    // Clear timed-out requests off the old end first, in either mode.
+    while (q.length > head && t - arr[q[head]] > timeout[q[head]]) shed[q[head++]] = 1;
+    const newestFirst = lifo && t - nonEmptySince > interval;
     while (q.length > head) {
-      const id = q[head++];
+      const id = newestFirst ? q.pop() : q[head++];
       if (t - arr[id] <= timeout[id]) return id;
       shed[id] = 1;
     }
@@ -96,7 +108,9 @@ export function simulate({
     }
   }
 
-  return measure({ arr, svc, startAt, doneAt, shed, servers, service, duration, warmup, deadline });
+  const out = measure({ arr, svc, startAt, doneAt, shed, servers, service, duration, warmup, deadline });
+  if (bucket > 0) out.timeline = timeline({ arr, doneAt, startAt, servers, service, duration, deadline, bucket });
+  return out;
 }
 
 // Summarise requests that arrived after the warmup window.
@@ -143,6 +157,25 @@ export function measure({ arr, svc, startAt, doneAt, shed, servers, service, dur
     // Server time inside the measured window that was spent serving.
     utilization: busy / (servers * span),
   };
+}
+
+// Goodput (fraction of capacity) and p99 of served requests per time bucket.
+export function timeline({ arr, doneAt, startAt, servers, service, duration, deadline, bucket }) {
+  const k = Math.ceil(duration / bucket);
+  const served = Array.from({ length: k }, () => []);
+  const good = new Float64Array(k);
+  for (let id = 0; id < arr.length; id++) {
+    if (Number.isNaN(startAt[id])) continue;
+    const b = Math.floor(arr[id] / bucket), rt = doneAt[id] - arr[id];
+    served[b].push(rt);
+    if (rt <= deadline) good[b]++;
+  }
+  const cap = (servers / service) * bucket;
+  return served.map((xs, b) => ({
+    t: b * bucket,
+    goodput: good[b] / cap,
+    p99: percentile(Float64Array.from(xs).sort(), 0.99),
+  }));
 }
 
 // Mean time in system for M/M/1: 1 / (mu - lambda).
