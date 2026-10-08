@@ -1,11 +1,14 @@
 {
   "name": "load-shedding-lab",
   "version": "0.1.0",
-  "description": "What a server should do when more work arrives than it can finish: FIFO goodput collapse, drop-tail, CoDel queue timeouts, adaptive LIFO, client-side throttling and adaptive concurrency limits, each simulated on seeded workloads and checked against queueing theory.",
+  "description": "What a server should do when more work arrives than it can finish: FIFO goodput collapse, drop-tail, CoDel queue timeouts, adaptive LIFO and client-side throttling, each simulated on seeded workloads and checked against queueing theory.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "compare": "node examples/compare.js"
   }
 }
